@@ -1,0 +1,37 @@
+name: Build inFAMOUS Second Son v1.1.1 - Xeon sem AVX2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-avx1:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Ativar compilador Windows x64
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+      - name: Baixar tag oficial v1.1.1 e submodulos
+        shell: pwsh
+        run: git clone --depth 1 --branch second-son-v1.1.1 --single-branch --recurse-submodules --shallow-submodules https://github.com/axylpup/shadPS4.git source
+      - name: Corrigir requisito AVX2 do fork
+        shell: pwsh
+        run: |
+          $f = 'source/CMakeLists.txt'
+          $txt = [IO.File]::ReadAllText($f)
+          if (-not $txt.Contains('add_compile_options(-march=x86-64-v3)')) { throw 'Flag esperada nao encontrada no CMakeLists.txt da tag v1.1.1' }
+          $txt = $txt.Replace('add_compile_options(-march=x86-64-v3)', 'add_compile_options(-march=sandybridge)')
+          [IO.File]::WriteAllText($f, $txt)
+          Write-Host 'ISA alvo: Sandy Bridge (AVX1; sem AVX2, BMI2 ou FMA).'
+      - name: Configurar
+        shell: pwsh
+        run: cmake -S source -B build-avx1 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+      - name: Compilar
+        shell: pwsh
+        run: cmake --build build-avx1 --config Release --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Guardar EXE compilado
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxylPup-v1.1.1-Xeon-AVX1-sem-AVX2
+          path: build-avx1/shadPS4.exe
+          if-no-files-found: error
