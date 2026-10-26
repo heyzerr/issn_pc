@@ -1,0 +1,119 @@
+name: Build AxylPup Second Son 1.1.1 - Xeon AVX1 + BMI1 ANDN
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-xeon-bmi1:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Preparar compilador x64
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+      - name: Baixar AxylPup v1.1.1 com submodulos
+        shell: pwsh
+        run: git clone --depth 1 --branch second-son-v1.1.1 --single-branch --recurse-submodules --shallow-submodules https://github.com/axylpup/shadPS4.git source
+      - name: Manter AVX1 e remover requerimento AVX2 do compilador
+        shell: pwsh
+        run: |
+          $file = 'source/CMakeLists.txt'
+          $text = [IO.File]::ReadAllText($file)
+          $old = 'add_compile_options(-march=x86-64-v3)'
+          if (-not $text.Contains($old)) { throw 'Nao localizei -march=x86-64-v3; revisar tag.' }
+          $text = $text.Replace($old, 'add_compile_options(-march=sandybridge)')
+          [IO.File]::WriteAllText($file, $text)
+      - name: Corrigir instrucao BMI1 ANDN do libc.prx (sem custo por frame)
+        shell: pwsh
+        run: |
+          $file = 'source/src/core/cpu_patches.cpp'
+          $text = [IO.File]::ReadAllText($file)
+          $anchor = 'static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches = {'
+          $block = @'
+          // Xeon / Sandy Bridge: Second Son libc.prx uses the BMI1 ANDN instruction.
+          // Replace unsupported register-only ANDN instructions with legacy ALU operations.
+          // ANDN dest, src1, src2 is exactly (~src1) & src2.  Ordinary AND has the
+          // same architecturally defined flags (SF/ZF according to result, CF/OF = 0).
+          // This runs once per static instruction via the regular CPU patch/trampoline
+          // system, avoiding expensive per-frame illegal-instruction exception handling.
+          static bool FilterNoBMI1ANDN(const ZydisDecodedOperand* operands) {
+              Cpu cpu;
+              if (cpu.has(Cpu::tBMI1)) {
+                  return false;
+              }
+              const u16 width = operands[0].size;
+              if (width != 32 && width != 64) {
+                  return false;
+              }
+              for (int index = 0; index < 3; ++index) {
+                  if (operands[index].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+                      operands[index].size != width) {
+                      return false;
+                  }
+                  // Saving a temporary below adjusts RSP; refuse RSP operands to avoid
+                  // reading its adjusted value instead of the original guest RSP.
+                  if (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64,
+                                                       operands[index].reg.value) == ZYDIS_REGISTER_RSP) {
+                      return false;
+                  }
+              }
+              return true;
+          }
+          
+          static void GenerateANDNLegacy(void* /* address */, const ZydisDecodedOperand* operands,
+                                         Xbyak::CodeGenerator& c) {
+              const auto dst = ZydisToXbyakRegisterOperand(operands[0]);
+              const auto src1 = ZydisToXbyakRegisterOperand(operands[1]);
+              const auto src2 = ZydisToXbyakRegisterOperand(operands[2]);
+          
+              // Select a spare register even if the destination aliases either source.
+              Xbyak::Reg64 temporary = r11;
+              for (const auto candidate : {r11, r10, r9, r8}) {
+                  if (candidate.getIdx() != dst.getIdx() &&
+                      candidate.getIdx() != src1.getIdx() &&
+                      candidate.getIdx() != src2.getIdx()) {
+                      temporary = candidate;
+                      break;
+                  }
+              }
+          
+              // Preserve the guest SysV red zone and the temporary. LEA/PUSH/POP/MOV/NOT
+              // do not alter flags. AND sets the required CF/OF/SF/ZF ANDN semantics.
+              c.lea(rsp, ptr[rsp - 128]);
+              c.push(temporary);
+              if (operands[0].size == 32) {
+                  const Xbyak::Reg32 temp32(temporary.getIdx());
+                  c.mov(temp32, src1);
+                  c.not_(temp32);
+                  c.and_(temp32, src2);
+                  c.mov(dst, temp32);
+              } else {
+                  c.mov(temporary, src1);
+                  c.not_(temporary);
+                  c.and_(temporary, src2);
+                  c.mov(dst, temporary);
+              }
+              c.pop(temporary);
+              c.lea(rsp, ptr[rsp + 128]);
+          }
+          '@
+          if (-not $text.Contains($anchor)) { throw 'Ancora nao encontrada no cpu_patches.cpp.' }
+          $text = $text.Replace($anchor, $block + "`n`n" + $anchor)
+          $key = '    // SSE4a'
+          if (-not $text.Contains($key)) { throw 'Tabela de patches nao encontrada.' }
+          $entry = "    // BMI1 ANDN fallback for Xeon E5-2440`n    {ZYDIS_MNEMONIC_ANDN, {{FilterNoBMI1ANDN, GenerateANDNLegacy, true}}},`n"
+          $text = $text.Replace($key, $entry + $key)
+          [IO.File]::WriteAllText($file, $text)
+          Write-Host 'ANDN convertido em MOV/NOT/AND num trampoline, flags preservadas.'
+      - name: Configurar compilacao
+        shell: pwsh
+        run: cmake -S source -B build-avx1 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+      - name: Compilar
+        shell: pwsh
+        run: cmake --build build-avx1 --config Release --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Disponibilizar executavel corrigido
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxylPup-v111-Xeon-AVX1-BMI1-ANDN-FIX
+          path: build-avx1/shadPS4.exe
+          if-no-files-found: error
